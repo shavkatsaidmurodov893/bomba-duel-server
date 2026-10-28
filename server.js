@@ -66,7 +66,7 @@ function getOpp(room, userId) {
   const o = room.players[1 - i];
   if (!o) return null;
   if (o.userId === 'bot') return { id: 'bot', name: 'Bot', av: '🤖', rating: 0 };
-  return U.pub(U.byId(o.userId));
+  return U.pub(U.byId(o.userId)); // byId is now async — call sites need await
 }
 
 function pushState(room) {
@@ -91,7 +91,7 @@ function pushState(room) {
   }
 }
 
-function settle(room) {
+async function settle(room) {
   const g = room.g;
   if (!g || g.ph !== 'end') return;
   if (Math.min(g.open[0].size, g.open[1].size) < 3) {
@@ -102,13 +102,13 @@ function settle(room) {
   for (let i = 0; i < room.players.length; i++) {
     const p = room.players[i];
     if (p.userId === 'bot') continue;
-    const u = U.byId(p.userId);
+    const u = await U.byId(p.userId);
     if (!u) continue;
     const score = g.res === -1 ? 0.5 : g.res === i ? 1 : 0;
     const mul = room.kind === 'bot' ? 0.1 : room.rated ? 1 : 0.25;
     const opp = room.players[1 - i];
     const oid = opp ? opp.userId : 'bot';
-    const oppU = oid !== 'bot' ? U.byId(oid) : null;
+    const oppU = oid !== 'bot' ? await U.byId(oid) : null;
     const c = {
       lives: g.lives[i],
       oppMoves: g.open[1 - i].size,
@@ -117,7 +117,6 @@ function settle(room) {
       myTier: U.tierIdx(u.rating),
     };
     const rw = R.reward(u, oid, score, room.rated, day(), c, mul);
-    // Online diamond bonuses
     if (room.kind === 'queue' && !rw.none) {
       let o = 0;
       if (g.res === i && g.lives[i] === 3) o += 2;
@@ -129,21 +128,20 @@ function settle(room) {
       }
     }
     room.rew[i] = rw;
-    U.save();
+    if (U.usePg) await U.saveUser(u); else U.users[u.id] = u;
     const sid = userSocket.get(p.userId);
     if (sid) {
       const sock = io.sockets.sockets.get(sid);
-      if (sock) sock.emit('me', U.mine(u));
+      if (sock) sock.emit('me', await U.mine(u));
     }
   }
 }
 
-function after(room) {
+async function after(room) {
   if (!room || !room.g) return;
-  if (room.g.ph === 'end' && !room.rew) settle(room);
+  if (room.g.ph === 'end' && !room.rew) await settle(room);
   pushState(room);
 
-  // Bot move
   if (room.kind === 'bot' && room.g.ph === 'play' && !room.g.pending && room.g.cur === 1 && !room.bt) {
     room.bt = setTimeout(() => {
       room.bt = null;
@@ -151,12 +149,11 @@ function after(room) {
     }, 700 + Math.random() * 600);
   }
 
-  // Advance after pending
   if (room.g.pending && !room.sch) {
     room.sch = true;
-    setTimeout(() => {
+    setTimeout(async () => {
       room.sch = false;
-      if (room.g && room.g.advance()) after(room);
+      if (room.g && room.g.advance()) await after(room);
     }, 1000);
   }
 }
@@ -215,14 +212,13 @@ function leaveQueue(socketId) {
   if (i >= 0) queue.splice(i, 1);
 }
 
-function tryMatch() {
+async function tryMatch() {
   if (queue.length < 2) return;
-  // Sort by rating proximity
   queue.sort((a, b) => a.rating - b.rating);
   const a = queue.shift();
   const b = queue.shift();
-  const ua = U.byId(a.userId);
-  const ub = U.byId(b.userId);
+  const ua = await U.byId(a.userId);
+  const ub = await U.byId(b.userId);
   if (!ua || !ub) return;
   const room = makeRoom('queue', true, [
     { userId: a.userId, socketId: a.socketId, idx: 0 },
@@ -259,11 +255,10 @@ setInterval(() => {
 io.on('connection', (socket) => {
   console.log('connect', socket.id);
 
-  socket.on('hello', (data, ack) => {
-    const u = U.getOrCreate(data && data.token);
+  socket.on('hello', async (data, ack) => {
+    const u = await U.getOrCreate(data && data.token);
     const oldSid = userSocket.get(u.id);
 
-    // Eski ulanishni tozalash (agar boshqa socket bo'lsa)
     if (oldSid && oldSid !== socket.id) {
       const oldSock = io.sockets.sockets.get(oldSid);
       if (oldSock) {
@@ -276,39 +271,37 @@ io.on('connection', (socket) => {
     socketUser.set(socket.id, u.id);
     userSocket.set(u.id, socket.id);
 
-    // Agar o'yin o'rtasida qayta ulangan bo'lsa, timeoutni bekor qil
     for (const room of rooms.values()) {
       const idx = playerIdx(room, u.id);
       if (idx >= 0 && room._dc && room._dc[idx]) {
         clearTimeout(room._dc[idx]);
         delete room._dc[idx];
-        // O'yin holatini qayta yubor
         if (room.g && room.g.ph !== 'end') {
           setTimeout(() => pushState(room), 100);
         }
       }
     }
 
-    if (typeof ack === 'function') ack({ token: u.token, me: U.mine(u) });
+    if (typeof ack === 'function') ack({ token: u.token, me: await U.mine(u) });
   });
 
-  socket.on('profile', (data, ack) => {
+  socket.on('profile', async (data, ack) => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
-    const r = U.updateProfile(u, data && data.name, data && data.av);
+    const r = await U.updateProfile(u, data && data.name, data && data.av);
     if (typeof ack === 'function') ack(r);
   });
 
-  socket.on('top', (data, ack) => {
+  socket.on('top', async (data, ack) => {
     if (typeof data === 'function') {
       ack = data;
       data = {};
     }
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     const ti = data && Number.isInteger(data.tier) ? data.tier : u ? U.tierIdx(u.rating) : 0;
-    const r = U.top(ti);
+    const r = await U.top(ti);
     if (u) {
       const list = r.list;
       const meIdx = list.findIndex((x) => x.id === u.id);
@@ -317,9 +310,9 @@ io.on('connection', (socket) => {
     if (typeof ack === 'function') ack(r);
   });
 
-  socket.on('bot', () => {
+  socket.on('bot', async () => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return;
     leaveQueue(socket.id);
     const room = makeRoom('bot', false, [
@@ -331,12 +324,11 @@ io.on('connection', (socket) => {
     startGame(room);
   });
 
-  socket.on('queue', () => {
+  socket.on('queue', async () => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return;
     leaveQueue(socket.id);
-    // Already in a live room?
     for (const room of rooms.values()) {
       if (room.g && room.g.ph !== 'end' && room.players.some((p) => p.userId === uid)) {
         return;
@@ -346,13 +338,9 @@ io.on('connection', (socket) => {
     tryMatch();
   });
 
-  socket.on('unqueue', () => {
-    leaveQueue(socket.id);
-  });
-
-  socket.on('create', (ack) => {
+  socket.on('create', async (ack) => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
     leaveQueue(socket.id);
     const room = makeRoom('friend', false, [{ userId: u.id, socketId: socket.id, idx: 0 }]);
@@ -360,14 +348,11 @@ io.on('connection', (socket) => {
     if (typeof ack === 'function') ack({ code: room.code });
   });
 
-  socket.on('join', (data, ack) => {
+  socket.on('join', async (data, ack) => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
-    const code = String((data && data.code) || '')
-      .replace(/\s/g, '')
-      .toUpperCase();
-    // Allow numeric codes
+    const code = String((data && data.code) || '').replace(/\s/g, '').toUpperCase();
     const room = rooms.get(code) || rooms.get(code.padStart(4, '0'));
     if (!room) return typeof ack === 'function' && ack({ err: 'Xona topilmadi' });
     leaveQueue(socket.id);
@@ -379,13 +364,14 @@ io.on('connection', (socket) => {
   function withRoom(fn) {
     const uid = socketUser.get(socket.id);
     if (!uid) return;
-    // Faqat hozirgi faol ulanish harakat qilishi mumkin
     if (userSocket.get(uid) !== socket.id) return;
 
     for (const room of rooms.values()) {
       const idx = playerIdx(room, uid);
       if (idx >= 0 && room.g && room.g.ph !== 'end') {
-        fn(room, idx, U.byId(uid));
+        U.byId(uid).then(u => {
+          if (u) fn(room, idx, u);
+        });
         return;
       }
     }
@@ -459,14 +445,23 @@ io.on('connection', (socket) => {
 
   // Economy
   const adTimers = new Map();
+  // TEST_MODE=true bo'lsa, 4.5s soxta reklama ishlaydi (kuniga 20 ta). Aks holda rad etiladi.
+  const TEST_MODE = process.env.TEST_MODE === 'true';
+
   socket.on('adstart', () => {
+    if (!TEST_MODE) return;
     adTimers.set(socket.id, Date.now());
   });
-  socket.on('adclaim', (ack) => {
+
+  socket.on('adclaim', async (ack) => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
     if (userSocket.get(uid) !== socket.id) return typeof ack === 'function' && ack({ err: 'Noto‘g‘ri ulanish' });
+
+    if (!TEST_MODE) {
+      return typeof ack === 'function' && ack({ err: 'Reklama mukofoti hozircha mavjud emas' });
+    }
 
     const t0 = adTimers.get(socket.id) || 0;
     if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
@@ -477,33 +472,39 @@ io.on('connection', (socket) => {
       u.adDay = t;
       u.adN = 0;
     }
-    // Kunlik limit (hozircha 20 ta)
     if (u.adN >= 20) return typeof ack === 'function' && ack({ err: 'Bugungi reklama limiti tugadi' });
 
     u.adN++;
     u.olmos = (u.olmos || 0) + 1;
-    U.save();
-    if (typeof ack === 'function') ack({ me: U.mine(u) });
+    if (U.usePg) await U.saveUser(u); else U.users[u.id] = u;
+    if (typeof ack === 'function') ack({ me: await U.mine(u) });
   });
 
-  socket.on('exchange', (data, ack) => {
+  socket.on('exchange', async (data, ack) => {
     const uid = socketUser.get(socket.id);
-    const u = U.byId(uid);
+    const u = await U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
     const can = Math.floor(u.coins / 70);
     if (can < 1) return typeof ack === 'function' && ack({ err: '70 tanga kerak' });
     const n = Math.max(1, Math.min(Math.floor(+(data && data.n) || 1), can));
     u.coins -= n * 70;
     u.olmos = (u.olmos || 0) + n;
-    U.save();
-    if (typeof ack === 'function') ack({ me: U.mine(u) });
+    if (U.usePg) {
+      await U.saveUser(u);
+    } else {
+      // JSON: byId dan kelgan obyekt allaqachon users ichida
+      // o'zgarishlar saqlanadi
+    }
+    console.log('exchange', uid, 'coins:', u.coins, 'olmos:', u.olmos);
+    if (typeof ack === 'function') ack({ me: await U.mine(u) });
   });
 
   socket.on('double', (ack) => {
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
-    // Find ended room reward
+    if (!TEST_MODE) return typeof ack === 'function' && ack({ err: 'Reklama mukofoti hozircha mavjud emas' });
+
     for (const room of rooms.values()) {
       const idx = playerIdx(room, uid);
       if (idx < 0 || !room.rew || !room.rew[idx]) continue;
@@ -521,6 +522,46 @@ io.on('connection', (socket) => {
       return;
     }
     if (typeof ack === 'function') ack({ err: 'Hozir mumkin emas' });
+  });
+
+  // Google Play Billing — xaridni tasdiqlash
+  // Android ilova purchaseToken va productId yuboradi
+  socket.on('purchase', async (data, ack) => {
+    const uid = socketUser.get(socket.id);
+    const u = await U.byId(uid);
+    if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
+    if (userSocket.get(uid) !== socket.id) return typeof ack === 'function' && ack({ err: 'Noto‘g‘ri ulanish' });
+
+    const { productId, purchaseToken } = data || {};
+    if (!productId || !purchaseToken) {
+      return typeof ack === 'function' && ack({ err: 'Ma’lumot yetarli emas' });
+    }
+
+    // Tanga paketlari (do'kon rasmidagi)
+    const PACKS = {
+      'coins_3000': 3000,
+      'coins_7000': 7000,
+      'coins_15000': 15000,
+      'coins_40000': 40000,
+    };
+    const amount = PACKS[productId];
+    if (!amount) return typeof ack === 'function' && ack({ err: 'Noto‘g‘ri mahsulot' });
+
+    // Haqiqiy tasdiqlashdan keyin:
+    // u.coins = (u.coins || 0) + amount;
+    // if (U.usePg) await U.saveUser(u);
+    // ack({ me: await U.mine(u) });
+
+    if (typeof ack === 'function') ack({ err: 'Xarid tasdiqlash hali ulanmagan' });
+  });
+
+  // AdMob Server-Side Verification (SSV) — keyinroq
+  // AdMob rewarded ad tugagach, Google serverdan so‘rov yuboradi.
+  // Hozircha faqat endpoint.
+  app.get('/admob/ssv', (req, res) => {
+    // TODO: AdMob SSV signature tekshirish
+    // Hozircha rad etamiz
+    res.status(403).json({ err: 'AdMob SSV hali sozlanmagan' });
   });
 
   socket.on('disconnect', () => {
