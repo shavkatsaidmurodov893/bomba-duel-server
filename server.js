@@ -176,8 +176,13 @@ function startGame(room) {
   room.g = new Game();
   room.rew = null;
   if (room.kind === 'bot') {
-    // Bot always places randomly as player 1
-    room.g.place(1, [...rnd()]);
+    // Bot bomba qo'yadi
+    const cells = [];
+    while (cells.length < 5) {
+      const c = (Math.random() * 25) | 0;
+      if (!cells.includes(c)) cells.push(c);
+    }
+    room.g.place(1, cells);
   }
   after(room);
 }
