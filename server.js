@@ -5,16 +5,25 @@ const cors = require('cors');
 const { Game, rnd } = require('./game');
 const R = require('./reward');
 const U = require('./users');
+const db = require('./db');
 
 const PORT = process.env.PORT || 3001;
+const DISCONNECT_GRACE = 30000;
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // Health check
-const SERVER_VER = 'fix-2026-10-26a'; // Render'da yangi kod ishlayotganini shundan bilasiz
+const SERVER_VER = '2026-10-29-db';
 app.get('/', (req, res) => res.json({ ok: true, name: 'Bomba Duel Server', v: SERVER_VER }));
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', async (req, res) => {
+  try {
+    await db.getPool().query('SELECT 1');
+    res.json({ ok: true, db: true, v: SERVER_VER });
+  } catch (e) {
+    res.status(500).json({ ok: false, db: false });
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -28,6 +37,19 @@ const rooms = new Map(); // code -> room
 const queue = []; // { socketId, userId, rating }
 const socketUser = new Map(); // socketId -> userId
 const userSocket = new Map(); // userId -> socketId
+
+// Oddiy token-bucket: bitta socket uchun event chastotasini cheklaydi
+function allow(socket, key, max, ms) {
+  const now = Date.now();
+  const buckets = socket._rl || (socket._rl = Object.create(null));
+  const b = buckets[key];
+  if (!b || now - b.t > ms) {
+    buckets[key] = { t: now, n: 1 };
+    return true;
+  }
+  b.n++;
+  return b.n <= max;
+}
 
 const day = () => new Date(Date.now() + 5 * 3600e3).toISOString().slice(0, 10);
 
@@ -67,7 +89,8 @@ function getOpp(room, userId) {
   const o = room.players[1 - i];
   if (!o) return null;
   if (o.userId === 'bot') return { id: 'bot', name: 'Bot', av: '🤖', rating: 0 };
-  return U.pub(U.byId(o.userId));
+  const ou = U.byId(o.userId);
+  return ou ? U.pub(ou) : null;
 }
 
 function pushState(room) {
@@ -89,6 +112,21 @@ function pushState(room) {
       reward: room.rew ? room.rew[idx] : null,
       ...view,
     });
+  }
+}
+
+// Socket'ni hisobga bog'laydi va faol o'yin holatini qaytaradi (reconnect)
+function bindSocket(socket, u) {
+  socketUser.set(socket.id, u.id);
+  userSocket.set(u.id, socket.id);
+  for (const room of rooms.values()) {
+    const idx = playerIdx(room, u.id);
+    if (idx < 0) continue;
+    if (room._dc && room._dc[idx]) {
+      clearTimeout(room._dc[idx]);
+      delete room._dc[idx];
+    }
+    if (room.g) pushState(room);
   }
 }
 
@@ -130,7 +168,7 @@ function settle(room) {
       }
     }
     room.rew[i] = rw;
-    U.save();
+    U.save(u);
     const sid = userSocket.get(p.userId);
     if (sid) {
       const sock = io.sockets.sockets.get(sid);
@@ -191,9 +229,16 @@ function joinRoom(socket, code, user) {
   if (!room) return { err: 'Xona topilmadi' };
   if (room.kind === 'bot') return { err: 'Xona topilmadi' };
   if (room.players.length >= 2) return { err: "Xona to'la" };
-  // Already in room?
+  // Allaqachon shu xonada — reconnect sifatida qayta bog'laymiz
   if (room.players.some((p) => p.userId === user.id)) {
-    return { ok: true, code, token: user.token, idx: playerIdx(room, user.id) };
+    const idx = playerIdx(room, user.id);
+    socket.join(code);
+    if (room._dc && room._dc[idx]) {
+      clearTimeout(room._dc[idx]);
+      delete room._dc[idx];
+    }
+    if (room.g) pushState(room);
+    return { ok: true, code, token: user.token, idx, rejoined: true };
   }
   room.players.push({ userId: user.id, socketId: socket.id, idx: 1 });
   socket.join(code);
@@ -205,7 +250,8 @@ function joinRoom(socket, code, user) {
   const sid0 = userSocket.get(p0.userId);
   if (sid0) {
     const s0 = io.sockets.sockets.get(sid0);
-    if (s0) s0.emit('matched', { code, token: U.byId(p0.userId).token, idx: 0 });
+    const u0 = U.byId(p0.userId);
+    if (s0 && u0) s0.emit('matched', { code, token: u0.token, idx: 0 });
   }
   startGame(room);
   return { ok: true, code, token: user.token, idx: 1 };
@@ -216,30 +262,50 @@ function leaveQueue(socketId) {
   if (i >= 0) queue.splice(i, 1);
 }
 
+// Hisob o'chirilganda navbat va xonalarni tozalaydi
+function cleanupUser(uid) {
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (queue[i].userId === uid) queue.splice(i, 1);
+  }
+  for (const [code, room] of rooms) {
+    const idx = playerIdx(room, uid);
+    if (idx < 0) continue;
+    if (room.g && room.g.ph !== 'end') {
+      room.g.finish(1 - idx, "Raqib hisobini o'chirdi");
+      after(room);
+    }
+    rooms.delete(code);
+  }
+}
+
 function tryMatch() {
-  if (queue.length < 2) return;
-  // Sort by rating proximity
-  queue.sort((a, b) => a.rating - b.rating);
-  const a = queue.shift();
-  const b = queue.shift();
-  const ua = U.byId(a.userId);
-  const ub = U.byId(b.userId);
-  if (!ua || !ub) return;
-  const room = makeRoom('queue', true, [
-    { userId: a.userId, socketId: a.socketId, idx: 0 },
-    { userId: b.userId, socketId: b.socketId, idx: 1 },
-  ]);
-  const sa = io.sockets.sockets.get(a.socketId);
-  const sb = io.sockets.sockets.get(b.socketId);
-  if (sa) {
+  while (queue.length >= 2) {
+    queue.sort((a, b) => a.rating - b.rating);
+    const a = queue.shift();
+    const b = queue.shift();
+    const ua = U.byId(a.userId);
+    const ub = U.byId(b.userId);
+    const sa = io.sockets.sockets.get(a.socketId);
+    const sb = io.sockets.sockets.get(b.socketId);
+    if (!ua || !sa) {
+      if (ub && sb) queue.push(b);
+      continue;
+    }
+    if (!ub || !sb) {
+      queue.push(a);
+      continue;
+    }
+    const room = makeRoom('queue', true, [
+      { userId: a.userId, socketId: a.socketId, idx: 0 },
+      { userId: b.userId, socketId: b.socketId, idx: 1 },
+    ]);
     sa.join(room.code);
     sa.emit('matched', { code: room.code, token: ua.token, idx: 0 });
-  }
-  if (sb) {
     sb.join(room.code);
     sb.emit('matched', { code: room.code, token: ub.token, idx: 1 });
+    startGame(room);
+    return;
   }
-  startGame(room);
 }
 
 // Tick all rooms
@@ -260,14 +326,65 @@ setInterval(() => {
 io.on('connection', (socket) => {
   console.log('connect', socket.id);
 
-  socket.on('hello', (data, ack) => {
-    const u = U.getOrCreate(data && data.token);
-    socketUser.set(socket.id, u.id);
-    userSocket.set(u.id, socket.id);
+  socket.on('hello', async (data, ack) => {
+    if (!allow(socket, 'hello', 20, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish, birozdan keyin qayta urinib ko'ring" });
+    }
+    try {
+      const { u, code } = await U.getOrCreate(data && data.token);
+      bindSocket(socket, u);
+      if (typeof ack === 'function') {
+        ack({ token: u.token, me: U.mine(u), ver: SERVER_VER, recoveryCode: code || undefined });
+      }
+    } catch (e) {
+      console.error('hello error', e.message);
+      if (typeof ack === 'function') ack({ err: 'Server xatosi' });
+    }
+  });
+
+  // Tiklash kodi bilan hisobga kirish (yangi qurilmada)
+  socket.on('recover', (data, ack) => {
+    if (!allow(socket, 'recover', 5, 5 * 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish. 5 daqiqadan keyin qayta urinib ko'ring" });
+    }
+    const u = U.recoverByCode(data && data.code);
+    if (!u) return typeof ack === 'function' && ack({ err: 'Kod topilmadi' });
+    bindSocket(socket, u);
     if (typeof ack === 'function') ack({ token: u.token, me: U.mine(u), ver: SERVER_VER });
   });
 
+  // Joriy qurilmada yangi tiklash kodi olish
+  socket.on('newcode', (ack) => {
+    const u = U.byId(socketUser.get(socket.id));
+    if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
+    if (!allow(socket, 'newcode', 3, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
+    const code = U.rotateCode(u);
+    if (typeof ack === 'function') ack({ code });
+  });
+
+  // Hisobni butunlay o'chirish
+  socket.on('delete', async (ack) => {
+    const uid = socketUser.get(socket.id);
+    const u = U.byId(uid);
+    if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
+    try {
+      cleanupUser(uid);
+      await U.removeUser(u);
+      socketUser.delete(socket.id);
+      userSocket.delete(uid);
+      if (typeof ack === 'function') ack({ ok: 1 });
+    } catch (e) {
+      console.error('delete error', e.message);
+      if (typeof ack === 'function') ack({ err: 'Server xatosi' });
+    }
+  });
+
   socket.on('profile', (data, ack) => {
+    if (!allow(socket, 'profile', 10, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
@@ -293,6 +410,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('bot', () => {
+    if (!allow(socket, 'bot', 20, 60000)) return;
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return;
@@ -311,6 +429,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('queue', () => {
+    if (!allow(socket, 'queue', 20, 60000)) return;
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return;
@@ -330,6 +449,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('create', (ack) => {
+    if (!allow(socket, 'create', 10, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
@@ -340,6 +462,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join', (data, ack) => {
+    if (!allow(socket, 'join', 10, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
@@ -358,6 +483,8 @@ io.on('connection', (socket) => {
   function withRoom(fn) {
     const uid = socketUser.get(socket.id);
     if (!uid) return;
+    const u = U.byId(uid);
+    if (!u) return;
     // Eng yangi (hozirgi) xonani tanlaymiz: eski tugallanmagan xonalar yo'lga to'sqinlik qilmasin
     let cur = null;
     for (const room of rooms.values()) {
@@ -365,22 +492,25 @@ io.on('connection', (socket) => {
         if (!cur || room.created >= cur.created) cur = room;
       }
     }
-    if (cur) fn(cur, playerIdx(cur, uid), U.byId(uid));
+    if (cur) fn(cur, playerIdx(cur, uid), u);
   }
 
   socket.on('place', (cells) => {
+    if (!allow(socket, 'place', 10, 10000)) return;
     withRoom((room, idx) => {
       if (room.g.place(idx, cells)) after(room);
     });
   });
 
   socket.on('open', (i) => {
+    if (!allow(socket, 'open', 15, 10000)) return;
     withRoom((room, idx) => {
       if (room.g.openCell(idx, i)) after(room);
     });
   });
 
   socket.on('zone', (i) => {
+    if (!allow(socket, 'zone', 10, 10000)) return;
     withRoom((room, idx, u) => {
       if ((u.olmos || 0) < 2) {
         socket.emit('msg', "Olmos yetmaydi: zona yordamchisi 2 💎 turadi");
@@ -392,7 +522,7 @@ io.on('connection', (socket) => {
       }
       if (room.g.zoneCheck(idx, i)) {
         u.olmos -= 2;
-        U.save();
+        U.save(u);
         socket.emit('me', U.mine(u));
         after(room);
       }
@@ -400,19 +530,23 @@ io.on('connection', (socket) => {
   });
 
   socket.on('time', () => {
+    if (!allow(socket, 'time', 10, 10000)) return;
     withRoom((room, idx) => {
       if (room.g.addTime(idx)) after(room);
     });
   });
 
   socket.on('lamp', (ack) => {
+    if (!allow(socket, 'lamp', 10, 10000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     withRoom((room, idx, u) => {
       if (room.g.ph !== 'play') return typeof ack === 'function' && ack({ err: 'Hozir mumkin emas' });
       const pr = room.g.lampPrice(idx);
       if ((u.olmos || 0) < pr) return typeof ack === 'function' && ack({ err: 'Olmos yetmaydi' });
       if (room.g.lamp(idx) === null) return typeof ack === 'function' && ack({ err: "Hozir ishlatib bo'lmaydi" });
       u.olmos -= pr;
-      U.save();
+      U.save(u);
       socket.emit('me', U.mine(u));
       if (typeof ack === 'function') ack({ ok: 1 });
       after(room);
@@ -443,21 +577,27 @@ io.on('connection', (socket) => {
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
-    const t0 = adTimers.get(socket.id) || 0;
-    if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
-    adTimers.delete(socket.id);
     const t = day();
     if (u.adDay !== t) {
       u.adDay = t;
       u.adN = 0;
     }
+    if ((u.adN || 0) >= U.AD_DAILY) {
+      return typeof ack === 'function' && ack({ err: 'Bugungi reklamalar tugadi' });
+    }
+    const t0 = adTimers.get(socket.id) || 0;
+    if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
+    adTimers.delete(socket.id);
     u.adN++;
     u.olmos = (u.olmos || 0) + 1;
-    U.save();
+    U.save(u);
     if (typeof ack === 'function') ack({ me: U.mine(u) });
   });
 
   socket.on('exchange', (data, ack) => {
+    if (!allow(socket, 'exchange', 20, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
@@ -466,11 +606,14 @@ io.on('connection', (socket) => {
     const n = Math.max(1, Math.min(Math.floor(+(data && data.n) || 1), can));
     u.coins -= n * 70;
     u.olmos = (u.olmos || 0) + n;
-    U.save();
+    U.save(u);
     if (typeof ack === 'function') ack({ me: U.mine(u) });
   });
 
   socket.on('double', (ack) => {
+    if (!allow(socket, 'double', 20, 60000)) {
+      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
+    }
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
@@ -479,14 +622,14 @@ io.on('connection', (socket) => {
       const idx = playerIdx(room, uid);
       if (idx < 0 || !room.rew || !room.rew[idx]) continue;
       const rw = room.rew[idx];
-      if (rw.none || !rw.coins || rw.doubled) return typeof ack === 'function' && ack({ err: 'Hozir mumkin emas' });
+      if (rw.none || !rw.coins || rw.doubled) continue;
       const t0 = adTimers.get(socket.id) || 0;
       if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
       adTimers.delete(socket.id);
       u.coins += rw.coins;
       rw.coins *= 2;
       rw.doubled = true;
-      U.save();
+      U.save(u);
       if (typeof ack === 'function') ack({ me: U.mine(u) });
       pushState(room);
       return;
@@ -497,29 +640,55 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('disconnect', socket.id);
     leaveQueue(socket.id);
+    adTimers.delete(socket.id);
     const uid = socketUser.get(socket.id);
     socketUser.delete(socket.id);
     if (uid && userSocket.get(uid) === socket.id) userSocket.delete(uid);
 
-    // If in active game — opponent wins after short grace (optional: immediate)
+    // Qayta ulanish uchun 30 soniya vaqt beriladi
     if (uid) {
       for (const room of rooms.values()) {
         const idx = playerIdx(room, uid);
         if (idx < 0 || !room.g || room.g.ph === 'end') continue;
-        // Mark disconnected — simple: finish after 8s if still gone
         room._dc = room._dc || {};
+        if (room._dc[idx]) clearTimeout(room._dc[idx]);
         room._dc[idx] = setTimeout(() => {
-          if (userSocket.get(uid)) return; // reconnected
+          delete room._dc[idx];
+          if (userSocket.get(uid)) return; // qayta ulandi
           if (room.g && room.g.ph !== 'end') {
             room.g.finish(1 - idx, "Aloqa uzilgan o'yinchi yutqazdi");
             after(room);
           }
-        }, 8000);
+        }, DISCONNECT_GRACE);
       }
     }
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Bomba Duel server → http://localhost:${PORT}`);
+async function main() {
+  await db.init();
+  await U.init();
+  server.listen(PORT, () => {
+    console.log(`Bomba Duel server → http://localhost:${PORT}`);
+  });
+}
+
+let closing = false;
+async function shutdown(signal) {
+  if (closing) return;
+  closing = true;
+  console.log(`${signal}: server yopilmoqda...`);
+  try {
+    await U.flush();
+  } catch (e) {
+    console.error('flush error', e.message);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+main().catch((e) => {
+  console.error('Server start error:', e.message);
+  process.exit(1);
 });
