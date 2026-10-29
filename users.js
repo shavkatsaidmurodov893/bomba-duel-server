@@ -8,6 +8,7 @@ if (!SECRET) throw new Error('RECOVERY_SECRET talab qilinadi');
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LEN = 12;
+const AVS = ['🙂', '😎', '🤠', '🥷', '🦊', '🐯', '🐼', '🦁', '👽', '🤖', '👻', '🐸'];
 
 const users = new Map();
 const tokenIdx = new Map();
@@ -52,8 +53,8 @@ function mkUser() {
     id: crypto.randomUUID(),
     token: crypto.randomUUID(),
     recovery: '',
-    name: 'Oyinchi' + (1000 + ((Math.random() * 9000) | 0)),
-    av: '🙂',
+    name: 'Player' + (1000 + ((Math.random() * 9000) | 0)),
+    av: AVS[crypto.randomInt(AVS.length)],
     coins: 300,
     olmos: 40,
     rating: 0,
@@ -297,7 +298,6 @@ function updateProfile(u, name, av) {
     .slice(0, 12);
   if (n.length < 2) return { err: "Ism kamida 2 belgidan iborat bo'lsin" };
   u.name = n;
-  const AVS = ['🙂', '😎', '🤠', '🥷', '🦊', '🐯', '🐼', '🦁', '👽', '🤖', '👻', '🐸'];
   if (AVS.includes(av)) u.av = av;
   save(u);
   return { me: mine(u) };
