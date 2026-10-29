@@ -479,6 +479,22 @@ io.on('connection', (socket) => {
     leaveQueue(socket.id);
   });
 
+  // Mijoz o'yinni tark etdi (menyuga qaytdi): raqib kutib qolmasin
+  socket.on('leave', () => {
+    const uid = socketUser.get(socket.id);
+    if (!uid) return;
+    leaveQueueByUser(uid);
+    withRoom((room, idx) => {
+      if (room.g.ph !== 'end') {
+        room.g.finish(1 - idx, "Raqib o'yinni tark etdi");
+        after(room);
+      }
+    }, true);
+    for (const [code, room] of rooms) {
+      if (room.kind === 'friend' && !room.g && playerIdx(room, uid) >= 0) rooms.delete(code);
+    }
+  });
+
   socket.on('create', (ack) => {
     if (!allow(socket, 'create', 10, 60000)) {
       return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
