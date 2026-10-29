@@ -93,25 +93,35 @@ function getOpp(room, userId) {
   return ou ? U.pub(ou) : null;
 }
 
+// Hisobning barcha ulangan qurilmalari (bir akkaunt ikki qurilmada bo'lsa ham ikkisi ham holat oladi)
+function socketsOf(uid) {
+  const out = [];
+  for (const s of io.sockets.sockets.values()) if (socketUser.get(s.id) === uid) out.push(s);
+  return out;
+}
+
 function pushState(room) {
   if (!room || !room.g) return;
   const now = Date.now();
-  for (const p of room.players) {
-    if (p.userId === 'bot') continue;
-    const sid = userSocket.get(p.userId);
-    if (!sid) continue;
-    const sock = io.sockets.sockets.get(sid);
-    if (!sock) continue;
-    const idx = playerIdx(room, p.userId);
-    const view = room.g.view(idx, now);
-    sock.emit('state', {
-      code: room.code,
-      rated: room.rated,
-      noLamp: false,
-      opp: getOpp(room, p.userId),
-      reward: room.rew ? room.rew[idx] : null,
-      ...view,
-    });
+  const cache = new Map();
+  for (const s of io.sockets.sockets.values()) {
+    const uid = socketUser.get(s.id);
+    if (!uid) continue;
+    const idx = playerIdx(room, uid);
+    if (idx < 0) continue;
+    let payload = cache.get(idx);
+    if (!payload) {
+      payload = {
+        code: room.code,
+        rated: room.rated,
+        noLamp: false,
+        opp: getOpp(room, uid),
+        reward: room.rew ? room.rew[idx] : null,
+        ...room.g.view(idx, now),
+      };
+      cache.set(idx, payload);
+    }
+    s.emit('state', payload);
   }
 }
 
@@ -119,6 +129,7 @@ function pushState(room) {
 function bindSocket(socket, u) {
   socketUser.set(socket.id, u.id);
   userSocket.set(u.id, socket.id);
+  let cur = null;
   for (const room of rooms.values()) {
     const idx = playerIdx(room, u.id);
     if (idx < 0) continue;
@@ -126,8 +137,10 @@ function bindSocket(socket, u) {
       clearTimeout(room._dc[idx]);
       delete room._dc[idx];
     }
-    if (room.g) pushState(room);
+    // Faqat tugamagan eng yangi xonani tiklaymiz — eski natijalar qayta yuborilmaydi
+    if (room.g && room.g.ph !== 'end' && (!cur || room.created >= cur.created)) cur = room;
   }
+  if (cur) pushState(cur);
 }
 
 function settle(room) {
@@ -169,11 +182,7 @@ function settle(room) {
     }
     room.rew[i] = rw;
     U.save(u);
-    const sid = userSocket.get(p.userId);
-    if (sid) {
-      const sock = io.sockets.sockets.get(sid);
-      if (sock) sock.emit('me', U.mine(u));
-    }
+    for (const sock of socketsOf(p.userId)) sock.emit('me', U.mine(u));
   }
 }
 
@@ -228,7 +237,6 @@ function joinRoom(socket, code, user) {
   const room = rooms.get(code);
   if (!room) return { err: 'Xona topilmadi' };
   if (room.kind === 'bot') return { err: 'Xona topilmadi' };
-  if (room.players.length >= 2) return { err: "Xona to'la" };
   // Allaqachon shu xonada — reconnect sifatida qayta bog'laymiz
   if (room.players.some((p) => p.userId === user.id)) {
     const idx = playerIdx(room, user.id);
@@ -237,9 +245,13 @@ function joinRoom(socket, code, user) {
       clearTimeout(room._dc[idx]);
       delete room._dc[idx];
     }
+    // Qayta kirishda har qanday holat yuboriladi (tugagan o'yin natijasi ham),
+    // aks holda mijoz "raqib kutilmoqda" ekranida qotib qoladi
     if (room.g) pushState(room);
     return { ok: true, code, token: user.token, idx, rejoined: true };
   }
+  if (room.players.length >= 2) return { err: "Xona to'la" };
+  abandonRooms(user.id, code);
   room.players.push({ userId: user.id, socketId: socket.id, idx: 1 });
   socket.join(code);
   // Notify both
@@ -247,12 +259,8 @@ function joinRoom(socket, code, user) {
   socket.emit('matched', matched);
   // First player
   const p0 = room.players[0];
-  const sid0 = userSocket.get(p0.userId);
-  if (sid0) {
-    const s0 = io.sockets.sockets.get(sid0);
-    const u0 = U.byId(p0.userId);
-    if (s0 && u0) s0.emit('matched', { code, token: u0.token, idx: 0 });
-  }
+  const u0 = U.byId(p0.userId);
+  if (u0) for (const s0 of socketsOf(p0.userId)) s0.emit('matched', { code, token: u0.token, idx: 0 });
   startGame(room);
   return { ok: true, code, token: user.token, idx: 1 };
 }
@@ -260,6 +268,22 @@ function joinRoom(socket, code, user) {
 function leaveQueue(socketId) {
   const i = queue.findIndex((q) => q.socketId === socketId);
   if (i >= 0) queue.splice(i, 1);
+}
+
+function leaveQueueByUser(uid) {
+  for (let i = queue.length - 1; i >= 0; i--) if (queue[i].userId === uid) queue.splice(i, 1);
+}
+
+// Bitta hisob ikki faol o'yinda qolmasligi kerak: eskisida mag'lubiyat yoziladi,
+// aks holda mijoz ikki xonadan aralash holat oladi
+function abandonRooms(uid, keepCode) {
+  for (const room of rooms.values()) {
+    if (keepCode && room.code === keepCode) continue;
+    const idx = playerIdx(room, uid);
+    if (idx < 0 || !room.g || room.g.ph === 'end') continue;
+    room.g.finish(1 - idx, "Raqib boshqa o'yinga o'tdi");
+    after(room);
+  }
 }
 
 // Hisob o'chirilganda navbat va xonalarni tozalaydi
@@ -293,6 +317,11 @@ function tryMatch() {
     }
     if (!ub || !sb) {
       queue.push(a);
+      continue;
+    }
+    // Bir hisob o'zi bilan o'ynamaydi (bir akkaunt ikki qurilmada)
+    if (a.userId === b.userId) {
+      queue.push(b);
       continue;
     }
     const room = makeRoom('queue', true, [
@@ -414,11 +443,12 @@ io.on('connection', (socket) => {
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return;
-    leaveQueue(socket.id);
+    leaveQueueByUser(u.id);
     // Foydalanuvchining oldingi bot o'yinlari (tugamay qolganlari) o'chiriladi
     for (const [code, r] of rooms) {
       if (r.kind === 'bot' && playerIdx(r, u.id) >= 0) rooms.delete(code);
     }
+    abandonRooms(u.id);
     const room = makeRoom('bot', false, [
       { userId: u.id, socketId: socket.id, idx: 0 },
       { userId: 'bot', socketId: null, idx: 1 },
@@ -433,10 +463,11 @@ io.on('connection', (socket) => {
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return;
-    leaveQueue(socket.id);
+    leaveQueueByUser(uid);
     // Already in a live room?
     for (const room of rooms.values()) {
       if (room.g && room.g.ph !== 'end' && room.players.some((p) => p.userId === uid)) {
+        socket.emit('msg', "Avval joriy o'yinni tugating");
         return;
       }
     }
@@ -455,7 +486,8 @@ io.on('connection', (socket) => {
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
     if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
-    leaveQueue(socket.id);
+    leaveQueueByUser(u.id);
+    abandonRooms(u.id);
     const room = makeRoom('friend', false, [{ userId: u.id, socketId: socket.id, idx: 0 }]);
     socket.join(room.code);
     if (typeof ack === 'function') ack({ code: room.code });
@@ -474,7 +506,7 @@ io.on('connection', (socket) => {
     // Allow numeric codes
     const room = rooms.get(code) || rooms.get(code.padStart(4, '0'));
     if (!room) return typeof ack === 'function' && ack({ err: 'Xona topilmadi' });
-    leaveQueue(socket.id);
+    leaveQueueByUser(u.id);
     const r = joinRoom(socket, room.code, u);
     if (typeof ack === 'function') ack(r.err ? { err: r.err } : { token: r.token, code: r.code });
   });
@@ -493,7 +525,16 @@ io.on('connection', (socket) => {
       }
     }
     if (cur) fn(cur, playerIdx(cur, uid), u);
+    // Server qayta ishga tushgan yoki xona o'chirilgan bo'lsa, mijozga aytamiz —
+    // aks holda o'yin ekranida tugmalar "javob bermay" qotib qoladi
+    else if (!includeEnded) socket.emit('gone');
   }
+
+  // Mijoz sekin tarmoqda holatni yo'qotib qo'ysa, o'zi so'rab yangilaydi
+  socket.on('sync', () => {
+    if (!allow(socket, 'sync', 30, 60000)) return;
+    withRoom((room) => pushState(room));
+  });
 
   socket.on('place', (cells) => {
     if (!allow(socket, 'place', 10, 10000)) return;
