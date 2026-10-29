@@ -480,7 +480,7 @@ io.on('connection', (socket) => {
   });
 
   // Game actions
-  function withRoom(fn) {
+  function withRoom(fn, includeEnded) {
     const uid = socketUser.get(socket.id);
     if (!uid) return;
     const u = U.byId(uid);
@@ -488,7 +488,7 @@ io.on('connection', (socket) => {
     // Eng yangi (hozirgi) xonani tanlaymiz: eski tugallanmagan xonalar yo'lga to'sqinlik qilmasin
     let cur = null;
     for (const room of rooms.values()) {
-      if (playerIdx(room, uid) >= 0 && room.g && room.g.ph !== 'end') {
+      if (playerIdx(room, uid) >= 0 && room.g && (includeEnded || room.g.ph !== 'end')) {
         if (!cur || room.created >= cur.created) cur = room;
       }
     }
@@ -565,7 +565,7 @@ io.on('connection', (socket) => {
       } else {
         pushState(room);
       }
-    });
+    }, true);
   });
 
   // Economy
