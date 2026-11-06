@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Health check
-const SERVER_VER = '2026-11-06-ssv';
+const SERVER_VER = '2026-11-06-ssv2';
 app.get('/', (req, res) => res.json({ ok: true, name: 'Bomba Duel Server', v: SERVER_VER }));
 app.get('/health', async (req, res) => {
   try {
@@ -121,14 +121,21 @@ function ssvAwait(uid, kind, code, cb) {
 app.get('/ssv/admob', async (req, res) => {
   const raw = (req.originalUrl || '').split('?')[1] || '';
   const cut = raw.indexOf('&signature=');
-  if (cut < 0) return res.status(400).send('missing signature');
   const q = new URLSearchParams(raw);
   try {
-    const ok = await ssvValid(raw.slice(0, cut), q.get('signature'), q.get('key_id'));
-    if (!ok) return res.status(400).send('bad signature');
-    if (q.get('ad_unit') !== ADMOB_REWARD_UNIT) return res.status(400).send('bad ad unit');
-    const ts = Number(q.get('timestamp'));
-    if (!ts || Math.abs(Date.now() - ts) > SSV_MAX_AGE) return res.status(400).send('stale');
+    let valid = false;
+    if (cut >= 0 && q.get('signature') && q.get('key_id')) {
+      const ok = await ssvValid(raw.slice(0, cut), q.get('signature'), q.get('key_id'));
+      if (ok && q.get('ad_unit') === ADMOB_REWARD_UNIT) {
+        const ts = Number(q.get('timestamp'));
+        valid = ts && Math.abs(Date.now() - ts) <= SSV_MAX_AGE;
+      }
+    }
+    if (!valid) {
+      // AdMob "Verify" test ping yoki noto'g'ri imzo — 200 qaytaramiz, lekin mukofot bermaymiz.
+      // Bu shuningdek qalbakiy so'rovlarni zaxarlamaslik uchun kerak.
+      return res.status(200).send('ignored');
+    }
     const tx = q.get('transaction_id') || '';
     if (tx && ssvSeenBefore(tx)) return res.status(200).send('duplicate');
     const uid = q.get('user_id') || '';
@@ -137,7 +144,7 @@ app.get('/ssv/admob', async (req, res) => {
     res.status(200).send('ok');
   } catch (e) {
     console.error('ssv error', e.message);
-    res.status(500).send('error');
+    res.status(200).send('error');
   }
 });
 
