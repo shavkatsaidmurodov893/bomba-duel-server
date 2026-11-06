@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Game, rnd } = require('./game');
@@ -14,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Health check
-const SERVER_VER = '2026-10-29-db';
+const SERVER_VER = '2026-11-06-ssv';
 app.get('/', (req, res) => res.json({ ok: true, name: 'Bomba Duel Server', v: SERVER_VER }));
 app.get('/health', async (req, res) => {
   try {
@@ -22,6 +23,121 @@ app.get('/health', async (req, res) => {
     res.json({ ok: true, db: true, v: SERVER_VER });
   } catch (e) {
     res.status(500).json({ ok: false, db: false });
+  }
+});
+
+// --- AdMob SSV (server-side verification) ---
+const ADMOB_REWARD_UNIT = process.env.ADMOB_REWARD_UNIT || 'ca-app-pub-6745334246607969/9685904355';
+const SSV_KEYS_URL = process.env.SSV_KEYS_URL || 'https://www.gstatic.com/admob/reward/verifier-keys.json';
+const SSV_MAX_AGE = 60 * 60 * 1000;
+const SSV_WAIT = Number(process.env.SSV_WAIT_MS || 9000);
+let ssvKeys = { at: 0, map: new Map() };
+
+async function ssvKeysMap() {
+  if (Date.now() - ssvKeys.at < SSV_MAX_AGE && ssvKeys.map.size) return ssvKeys.map;
+  const r = await fetch(SSV_KEYS_URL, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error('ssv keys ' + r.status);
+  const j = await r.json();
+  const map = new Map();
+  for (const k of j.keys || []) map.set(String(k.keyId), k.pem);
+  if (!map.size) throw new Error('ssv keys empty');
+  ssvKeys = { at: Date.now(), map };
+  return map;
+}
+
+async function ssvValid(signed, sig, keyId) {
+  const pem = (await ssvKeysMap()).get(String(keyId));
+  if (!pem || !sig) return false;
+  try {
+    return crypto.verify(
+      'sha256',
+      Buffer.from(signed, 'utf8'),
+      { key: pem, dsaEncoding: 'ieee-p1363' },
+      Buffer.from(String(sig), 'base64url')
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+const ssvPending = new Map(); // userId -> [{ k, room, at }]
+const ssvSeen = new Map(); // transaction_id -> vaqt
+
+function ssvSeenBefore(tx) {
+  const now = Date.now();
+  for (const [k, t] of ssvSeen) if (now - t > SSV_MAX_AGE) ssvSeen.delete(k);
+  if (ssvSeen.has(tx)) return true;
+  ssvSeen.set(tx, now);
+  return false;
+}
+
+function ssvQueue(uid, custom) {
+  const c = String(custom || 'r').slice(0, 64);
+  let e;
+  if (c.startsWith('d:')) {
+    const code = c.slice(2).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
+    if (!code) return false;
+    e = { k: 'd', room: code, at: Date.now() };
+  } else {
+    e = { k: 'r', at: Date.now() };
+  }
+  const arr = ssvPending.get(uid) || [];
+  arr.push(e);
+  ssvPending.set(uid, arr);
+  return true;
+}
+
+function ssvTake(uid, kind, code) {
+  const arr = ssvPending.get(uid);
+  if (!arr) return false;
+  let taken = false;
+  for (let i = 0; i < arr.length; i++) {
+    const e = arr[i];
+    if (Date.now() - e.at > 120000) {
+      arr.splice(i, 1);
+      i--;
+      continue;
+    }
+    if (taken || e.k !== kind) continue;
+    if (kind === 'd' && code && e.room !== code) continue;
+    arr.splice(i, 1);
+    i--;
+    taken = true;
+  }
+  if (!arr.length) ssvPending.delete(uid);
+  return taken;
+}
+
+// SSV callback ba'zan reklama yopilgandan keyin keladi — qisqa kutamiz
+function ssvAwait(uid, kind, code, cb) {
+  const t0 = Date.now();
+  (function poll() {
+    if (ssvTake(uid, kind, code)) return cb(true);
+    if (Date.now() - t0 > SSV_WAIT) return cb(false);
+    setTimeout(poll, 400);
+  })();
+}
+
+app.get('/ssv/admob', async (req, res) => {
+  const raw = (req.originalUrl || '').split('?')[1] || '';
+  const cut = raw.indexOf('&signature=');
+  if (cut < 0) return res.status(400).send('missing signature');
+  const q = new URLSearchParams(raw);
+  try {
+    const ok = await ssvValid(raw.slice(0, cut), q.get('signature'), q.get('key_id'));
+    if (!ok) return res.status(400).send('bad signature');
+    if (q.get('ad_unit') !== ADMOB_REWARD_UNIT) return res.status(400).send('bad ad unit');
+    const ts = Number(q.get('timestamp'));
+    if (!ts || Math.abs(Date.now() - ts) > SSV_MAX_AGE) return res.status(400).send('stale');
+    const tx = q.get('transaction_id') || '';
+    if (tx && ssvSeenBefore(tx)) return res.status(200).send('duplicate');
+    const uid = q.get('user_id') || '';
+    if (!uid || !U.byId(uid)) return res.status(200).send('unknown user');
+    ssvQueue(uid, q.get('custom_data'));
+    res.status(200).send('ok');
+  } catch (e) {
+    console.error('ssv error', e.message);
+    res.status(500).send('error');
   }
 });
 
@@ -626,29 +742,33 @@ io.on('connection', (socket) => {
   });
 
   // Economy
-  const adTimers = new Map();
-  socket.on('adstart', () => {
-    adTimers.set(socket.id, Date.now());
-  });
   socket.on('adclaim', (ack) => {
+    const done = (o) => typeof ack === 'function' && ack(o);
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
-    if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
+    if (!u) return done({ err: 'Avval kirish kerak' });
     const t = day();
     if (u.adDay !== t) {
       u.adDay = t;
       u.adN = 0;
     }
-    if ((u.adN || 0) >= U.AD_DAILY) {
-      return typeof ack === 'function' && ack({ err: 'Bugungi reklamalar tugadi' });
-    }
-    const t0 = adTimers.get(socket.id) || 0;
-    if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
-    adTimers.delete(socket.id);
-    u.adN++;
-    u.olmos = (u.olmos || 0) + 1;
-    U.save(u);
-    if (typeof ack === 'function') ack({ me: U.mine(u) });
+    if ((u.adN || 0) >= U.AD_DAILY) return done({ err: 'Bugungi reklamalar tugadi' });
+    // Mukofot faqat AdMob SSV callback tasdiqlagandan keyin beriladi
+    ssvAwait(uid, 'r', null, (ok) => {
+      if (!ok) return done({ err: 'Reklama tasdiqlanmadi. Qayta urinib ko‘ring' });
+      const u2 = U.byId(uid);
+      if (!u2) return done({ err: 'Avval kirish kerak' });
+      const t2 = day();
+      if (u2.adDay !== t2) {
+        u2.adDay = t2;
+        u2.adN = 0;
+      }
+      if ((u2.adN || 0) >= U.AD_DAILY) return done({ err: 'Bugungi reklamalar tugadi' });
+      u2.adN++;
+      u2.olmos = (u2.olmos || 0) + 1;
+      U.save(u2);
+      done({ me: U.mine(u2) });
+    });
   });
 
   socket.on('exchange', (data, ack) => {
@@ -668,36 +788,39 @@ io.on('connection', (socket) => {
   });
 
   socket.on('double', (ack) => {
-    if (!allow(socket, 'double', 20, 60000)) {
-      return typeof ack === 'function' && ack({ err: "Juda ko'p urinish" });
-    }
+    const done = (o) => typeof ack === 'function' && ack(o);
+    if (!allow(socket, 'double', 20, 60000)) return done({ err: "Juda ko'p urinish" });
     const uid = socketUser.get(socket.id);
     const u = U.byId(uid);
-    if (!u) return typeof ack === 'function' && ack({ err: 'Avval kirish kerak' });
+    if (!u) return done({ err: 'Avval kirish kerak' });
     // Find ended room reward
     for (const room of rooms.values()) {
       const idx = playerIdx(room, uid);
       if (idx < 0 || !room.rew || !room.rew[idx]) continue;
       const rw = room.rew[idx];
-      if (rw.none || !rw.coins || rw.doubled) continue;
-      const t0 = adTimers.get(socket.id) || 0;
-      if (Date.now() - t0 < 4500) return typeof ack === 'function' && ack({ err: "Reklamani oxirigacha ko'ring" });
-      adTimers.delete(socket.id);
-      u.coins += rw.coins;
-      rw.coins *= 2;
-      rw.doubled = true;
-      U.save(u);
-      if (typeof ack === 'function') ack({ me: U.mine(u) });
-      pushState(room);
+      if (rw.none || !rw.coins || rw.doubled || rw._doublePending) continue;
+      rw._doublePending = true;
+      ssvAwait(uid, 'd', room.code, (ok) => {
+        rw._doublePending = false;
+        if (!ok) return done({ err: 'Reklama tasdiqlanmadi. Qayta urinib ko‘ring' });
+        if (rw.none || !rw.coins || rw.doubled) return done({ err: 'Hozir mumkin emas' });
+        const u2 = U.byId(uid);
+        if (!u2) return done({ err: 'Avval kirish kerak' });
+        u2.coins += rw.coins;
+        rw.coins *= 2;
+        rw.doubled = true;
+        U.save(u2);
+        done({ me: U.mine(u2) });
+        pushState(room);
+      });
       return;
     }
-    if (typeof ack === 'function') ack({ err: 'Hozir mumkin emas' });
+    done({ err: 'Hozir mumkin emas' });
   });
 
   socket.on('disconnect', () => {
     console.log('disconnect', socket.id);
     leaveQueue(socket.id);
-    adTimers.delete(socket.id);
     const uid = socketUser.get(socket.id);
     socketUser.delete(socket.id);
     if (uid && userSocket.get(uid) === socket.id) userSocket.delete(uid);

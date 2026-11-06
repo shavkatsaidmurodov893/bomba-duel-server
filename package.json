@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Bomba Duel online multiplayer server",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --env-file-if-exists=.env server.js",
