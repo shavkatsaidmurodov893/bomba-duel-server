@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Health check
-const SERVER_VER = '2026-11-06-ssv2';
+const SERVER_VER = '2026-11-06-ssv3';
 app.get('/', (req, res) => res.json({ ok: true, name: 'Bomba Duel Server', v: SERVER_VER }));
 app.get('/health', async (req, res) => {
   try {
@@ -45,23 +45,37 @@ async function ssvKeysMap() {
   return map;
 }
 
+function ssvSigBuf(sig) {
+  const s = String(sig || '');
+  for (const enc of ['base64url', 'base64']) {
+    try {
+      const b = Buffer.from(s, enc);
+      if (b.length) return b;
+    } catch (e) {}
+  }
+  return null;
+}
+
 async function ssvValid(signed, sig, keyId) {
   const pem = (await ssvKeysMap()).get(String(keyId));
-  if (!pem || !sig) return false;
-  try {
-    return crypto.verify(
-      'sha256',
-      Buffer.from(signed, 'utf8'),
-      { key: pem, dsaEncoding: 'ieee-p1363' },
-      Buffer.from(String(sig), 'base64url')
-    );
-  } catch (e) {
-    return false;
+  const buf = ssvSigBuf(sig);
+  if (!pem || !buf) return false;
+  const data = Buffer.from(signed, 'utf8');
+  for (const dsa of ['ieee-p1363', 'der']) {
+    try {
+      if (crypto.verify('sha256', data, { key: pem, dsaEncoding: dsa }, buf)) return true;
+    } catch (e) {}
   }
+  return false;
 }
 
 const ssvPending = new Map(); // userId -> [{ k, room, at }]
 const ssvSeen = new Map(); // transaction_id -> vaqt
+const ssvLog = []; // so'nggi callback'lar diagnostika uchun
+function ssvLogPush(o) {
+  ssvLog.push({ t: Date.now(), ...o });
+  if (ssvLog.length > 50) ssvLog.shift();
+}
 
 function ssvSeenBefore(tx) {
   const now = Date.now();
@@ -120,17 +134,27 @@ function ssvAwait(uid, kind, code, cb) {
 
 app.get('/ssv/admob', async (req, res) => {
   const raw = (req.originalUrl || '').split('?')[1] || '';
-  const cut = raw.indexOf('&signature=');
+  // Imzo parametri qatorning istalgan joyida bo'lishi mumkin, faqat uni o'chiramiz
+  const signed = raw.replace(/(^|&)signature=[^&]*/g, '').replace(/^&/, '');
   const q = new URLSearchParams(raw);
   try {
     let valid = false;
-    if (cut >= 0 && q.get('signature') && q.get('key_id')) {
-      const ok = await ssvValid(raw.slice(0, cut), q.get('signature'), q.get('key_id'));
+    if (q.get('signature') && q.get('key_id')) {
+      const ok = await ssvValid(signed, q.get('signature'), q.get('key_id'));
       if (ok && q.get('ad_unit') === ADMOB_REWARD_UNIT) {
         const ts = Number(q.get('timestamp'));
         valid = ts && Math.abs(Date.now() - ts) <= SSV_MAX_AGE;
       }
     }
+    ssvLogPush({
+      valid,
+      adUnit: q.get('ad_unit'),
+      keyId: q.get('key_id'),
+      uid: q.get('user_id'),
+      custom: q.get('custom_data'),
+      tx: q.get('transaction_id'),
+      ts: q.get('timestamp'),
+    });
     if (!valid) {
       // AdMob "Verify" test ping yoki noto'g'ri imzo — 200 qaytaramiz, lekin mukofot bermaymiz.
       // Bu shuningdek qalbakiy so'rovlarni zaxarlamaslik uchun kerak.
@@ -147,6 +171,8 @@ app.get('/ssv/admob', async (req, res) => {
     res.status(200).send('error');
   }
 });
+
+app.get('/ssv/log', (req, res) => res.json(ssvLog));
 
 const server = http.createServer(app);
 const io = new Server(server, {
